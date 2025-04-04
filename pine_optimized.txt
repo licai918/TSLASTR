@@ -1,0 +1,130 @@
+//@version=6
+//(Updated 2025/04/05 - 超简化版本：移除SMA和ADX权重)
+strategy("Enhanced Tesla Reversal Strategy v10 (Ultra-Simplified)", overlay=true, pyramiding=2, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
+
+// === 输入参数 ===
+// 这里使用优化后的参数值（示例值，具体应使用Optuna优化结果）
+rsi_length       = input.int(7, "RSI长度", minval=1)
+iv_length        = input.int(126, "隐含波动率周期", minval=50)
+macd_fast        = input.int(8, "MACD快线周期")
+macd_slow        = input.int(17, "MACD慢线周期")
+macd_signal      = input.int(9, "MACD信号周期")
+adx_length       = input.int(14, "ADX长度") // 保留ADX计算，但仅作为过滤器使用
+volume_ma_period = input.int(20, "成交量均线周期")
+
+// Volume Spike参数
+volume_spike_window = input.int(20, "成交量峰值窗口", minval=5)
+volume_spike_mult = input.float(2.0, "成交量峰值倍数", minval=1.2)
+
+rsi_low_percentile  = input.int(30, "RSI低分位数")
+rsi_high_percentile = input.int(70, "RSI高分位数")
+iv_low_percentile   = input.int(30, "IV低分位数")
+iv_high_percentile  = input.int(70, "IV高分位数")
+take_profit_mult = input.float(2.0, "止盈波动率倍数", minval=0.5)
+stop_loss_mult   = input.float(2.0, "止损波动率倍数", minval=0.5)
+bullish_threshold = input.float(0.4, "多头评分阈值", minval=0.0, maxval=1.0)
+bearish_threshold = input.float(0.4, "空头评分阈值", minval=0.0, maxval=1.0)
+
+// === 权重设置（超简化版，仅保留RSI, IV, MACD和Volume权重） ===
+rsi_bull_weight    = input.float(0.35, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
+iv_bull_weight     = input.float(0.25, "IV多头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
+macd_bull_weight   = input.float(0.3, "MACD多头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
+volume_bull_weight = input.float(0.1, "成交量多头权重", minval=0.0, maxval=0.3, step=0.05)
+
+rsi_bear_weight    = input.float(0.35, "RSI空头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
+iv_bear_weight     = input.float(0.25, "IV空头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
+macd_bear_weight   = input.float(0.3, "MACD空头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
+volume_bear_weight = input.float(0.1, "成交量空头权重", minval=0.0, maxval=0.3, step=0.05)
+
+// === 指标计算 ===
+rsi = ta.rsi(close, rsi_length)
+[macdLine, signalLine, histLine] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+macd_change = ta.change(macdLine)
+
+[diplus, diminus, adx_value] = ta.dmi(adx_length, adx_length)
+volume_ma = ta.sma(volume, volume_ma_period)
+
+// 自定义隐含波动率计算（模拟）
+iv_rank(period) =>
+    hv = ta.stdev(close, period) / close * 100
+    hv_rank = (hv - ta.lowest(hv, period)) / (ta.highest(hv, period) - ta.lowest(hv, period)) * 100
+    [hv, hv_rank]
+
+[hv, iv] = iv_rank(iv_length)
+
+// 历史分位数阈值
+rsi_low  = ta.percentile_linear_interpolation(rsi, 250, rsi_low_percentile)
+rsi_high = ta.percentile_linear_interpolation(rsi, 250, rsi_high_percentile)
+iv_low   = ta.percentile_linear_interpolation(iv, 250, iv_low_percentile)
+iv_high  = ta.percentile_linear_interpolation(iv, 250, iv_high_percentile)
+
+// 计算Volume Spike指标
+volume_ratio = volume / volume_ma
+volume_spike = volume_ratio > volume_spike_mult
+volume_change = ta.change(volume) / volume[1] * 100
+volume_strength = volume_ratio * (1 + volume_change/100)
+
+// === 信号计算 (超简化版) ===
+bullish_score = 0.0
+bearish_score = 0.0
+
+// 仅当ADX > 20时才计算评分 (ADX仅作为过滤器)
+if adx_value > 20
+    // Volume Spike - 使用成交量强度和峰值
+    volume_factor = 0.0
+    if volume_spike and volume_change > 0  // 成交量峰值且上升
+        volume_factor := volume_bull_weight * math.min(volume_strength, 3.0) / 3.0  // 限制最大值
+    
+    // 多头评分组件
+    // RSI低于低阈值
+    if rsi < rsi_low * 1.1
+        bullish_score += rsi_bull_weight
+    // IV高于高阈值
+    if iv > iv_high * 0.9
+        bullish_score += iv_bull_weight
+    // MACD条件
+    if macdLine > signalLine * 0.95 or macd_change > 0
+        bullish_score += macd_bull_weight
+    // 添加成交量评分
+    bullish_score += volume_factor
+    
+    // 空头评分组件
+    // RSI高于高阈值
+    if rsi > rsi_high * 0.9
+        bearish_score += rsi_bear_weight
+    // IV低于低阈值
+    if iv < iv_low * 1.1
+        bearish_score += iv_bear_weight
+    // MACD条件
+    if macdLine < signalLine * 1.05 or macd_change < 0
+        bearish_score += macd_bear_weight
+    // 添加成交量评分 - 空头可能也需要高成交量
+    if volume_spike and volume_change < 0  // 成交量峰值且下降
+        bearish_score += volume_bear_weight * math.min(volume_strength, 3.0) / 3.0
+
+// === 交易逻辑 ===
+if (bullish_score >= bullish_threshold)
+    strategy.entry("Long", strategy.long, comment="Long")
+
+if (bearish_score >= bearish_threshold)
+    strategy.entry("Short", strategy.short, comment="Short")  // 恢复做空交易功能
+
+// === 动态止盈止损 ===
+if strategy.position_size > 0  // 如果持有多头仓位
+    long_take = strategy.position_avg_price * (1 + hv / 100 * take_profit_mult)
+    long_stop = strategy.position_avg_price * (1 - hv / 100 * stop_loss_mult)
+    strategy.exit("Exit Long", from_entry="Long", stop=long_stop, limit=long_take)
+
+if strategy.position_size < 0  // 如果持有空头仓位
+    short_take = strategy.position_avg_price * (1 - hv / 100 * take_profit_mult)
+    short_stop = strategy.position_avg_price * (1 + hv / 100 * stop_loss_mult)
+    strategy.exit("Exit Short", from_entry="Short", stop=short_stop, limit=short_take)
+
+// === 图表显示 ===
+plot(bullish_score, "多头评分", color=color.green, linewidth=2)
+plot(bearish_score, "空头评分", color=color.red, linewidth=2)
+hline(bullish_threshold, "多头阈值", color=color.green, linestyle=hline.style_dashed)
+hline(bearish_threshold, "空头阈值", color=color.red, linestyle=hline.style_dashed)
+
+// 显示Volume Spike
+plot(volume_spike ? high * 1.01 : na, "成交量峰值", style=plot.style_circles, color=color.yellow, linewidth=3) 
