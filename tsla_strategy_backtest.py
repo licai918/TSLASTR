@@ -53,9 +53,9 @@ print(f"系统CPU核心数: {cpu_count}")
 
 # %%
 # --- 回测和数据参数 ---
-TICKER = "TSLA"
+TICKER = "SHOP"
 START_DATE = "2024-12-17" # 修改为更合理的历史日期范围
-END_DATE = "2025-04-03"   # 修改为当前或过去的日期
+END_DATE = "2025-04-04"   # 修改为当前或过去的日期
 INTERVAL = "1h"          # 数据频率 ('1d', '1h', '30m', etc.) - 从'2h'改为'1h'，因为YF不支持2h间隔
 
 # --- 策略默认参数 (来自 Pine Script) ---
@@ -90,12 +90,12 @@ initial_params = {
 }
 
 # --- vectorbt 回测设置 ---
-INITIAL_CAPITAL = 5000
+INITIAL_CAPITAL = 100000
 PYRAMIDING = 1 # 允许的金字塔加仓次数
 PCT_OF_EQUITY = 100 # 每次交易使用的资金比例
 
 # --- Optuna 优化设置 ---
-N_TRIALS = 20000 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
+N_TRIALS = 5000 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
 OPTIMIZATION_METRIC = 'Total Return [%]' # 用于优化的目标指标 ('Total Return [%]', 'Sharpe Ratio', 'Max Drawdown [%]')
 
 # %% [markdown]
