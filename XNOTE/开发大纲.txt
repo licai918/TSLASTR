@@ -1,0 +1,165 @@
+“//@version=6
+//(Updated 2025/04/02)
+strategy("Enhanced Tesla Reversal Strategy v7 (Optimized)", overlay=true, pyramiding=2, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
+
+// === 输入参数 ===
+// 这里使用优化后的参数值（示例值，具体应使用Optuna优化结果）
+rsi_length       = input.int(19, "RSI长度", minval=1)
+iv_length        = input.int(130, "隐含波动率周期", minval=50)
+macd_fast        = input.int(12, "MACD快线周期")
+macd_slow        = input.int(24, "MACD慢线周期")
+macd_signal      = input.int(9, "MACD信号周期")
+adx_length       = input.int(16, "ADX长度")
+sma_short_period = input.int(34, "短期SMA周期")
+sma_long_period  = input.int(61, "长期SMA周期")
+volume_ma_period = input.int(27, "成交量均线周期")
+rsi_low_percentile  = input.int(34, "RSI低分位数")
+rsi_high_percentile = input.int(78, "RSI高分位数")
+iv_low_percentile   = input.int(37, "IV低分位数")
+iv_high_percentile  = input.int(74, "IV高分位数")
+take_profit_mult = input.float(3.0, "止盈波动率倍数", minval=0.5)
+stop_loss_mult   = input.float(3.5, "止损波动率倍数", minval=0.5)
+bullish_threshold = input.float(0.35, "多头评分阈值", minval=0.0, maxval=1.0)
+bearish_threshold = input.float(0.30, "空头评分阈值", minval=0.0, maxval=1.0)
+
+// === 权重设置（来自优化结果，示例值） ===
+rsi_bull_weight    = input.float(0.3, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)
+iv_bull_weight     = input.float(0.2, "IV多头权重", minval=0.0, maxval=0.4, step=0.05)
+macd_bull_weight   = input.float(0.2, "MACD多头权重", minval=0.0, maxval=0.4, step=0.05)
+sma_bull_weight    = input.float(0.1, "SMA多头权重", minval=0.0, maxval=0.3, step=0.05)
+adx_bull_weight    = input.float(0.1, "ADX多头权重", minval=0.0, maxval=0.3, step=0.05)
+volume_bull_weight = input.float(0.1, "成交量多头权重", minval=0.0, maxval=0.3, step=0.05)
+
+rsi_bear_weight    = input.float(0.3, "RSI空头权重", minval=0.0, maxval=0.5, step=0.05)
+iv_bear_weight     = input.float(0.2, "IV空头权重", minval=0.0, maxval=0.4, step=0.05)
+macd_bear_weight   = input.float(0.2, "MACD空头权重", minval=0.0, maxval=0.4, step=0.05)
+sma_bear_weight    = input.float(0.1, "SMA空头权重", minval=0.0, maxval=0.3, step=0.05)
+adx_bear_weight    = input.float(0.1, "ADX空头权重", minval=0.0, maxval=0.3, step=0.05)
+volume_bear_weight = input.float(0.1, "成交量空头权重", minval=0.0, maxval=0.3, step=0.05)
+
+// === 指标计算 ===
+rsi = ta.rsi(close, rsi_length)
+[macdLine, signalLine, histLine] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+macd_change = ta.change(macdLine)
+
+[diplus, diminus, adx_value] = ta.dmi(adx_length, adx_length)
+volume_ma = ta.sma(volume, volume_ma_period)
+
+sma_short = ta.sma(close, sma_short_period)
+sma_long = ta.sma(close, sma_long_period)
+
+// 自定义隐含波动率计算（模拟）
+iv_rank(period) =>
+    hv = ta.stdev(close, period) / close * 100
+    hv_rank = (hv - ta.lowest(hv, period)) / (ta.highest(hv, period) - ta.lowest(hv, period)) * 100
+    [hv, hv_rank]
+
+[hv, iv] = iv_rank(iv_length)
+
+// 历史分位数阈值
+rsi_low  = ta.percentile_linear_interpolation(rsi, 250, rsi_low_percentile)
+rsi_high = ta.percentile_linear_interpolation(rsi, 250, rsi_high_percentile)
+iv_low   = ta.percentile_linear_interpolation(iv, 250, iv_low_percentile)
+iv_high  = ta.percentile_linear_interpolation(iv, 250, iv_high_percentile)
+
+// === 信号计算 (条件放宽) ===
+volume_factor = volume > volume_ma ? 1 : 0
+
+// 更新后的多头评分计算 - 放宽条件以匹配Python版本
+bullish_score = 0.0
+// RSI低于低阈值*1.1 (放宽10%)
+if rsi < rsi_low * 1.1
+    bullish_score += rsi_bull_weight
+// IV高于高阈值*0.9 (放宽10%)
+if iv > iv_high * 0.9
+    bullish_score += iv_bull_weight
+// MACD条件放宽，任一条件成立即可
+if macdLine > signalLine * 0.95 or macd_change > 0
+    bullish_score += macd_bull_weight
+// SMA条件放宽，任一条件成立即可
+if close > sma_short * 0.98 or close > sma_long * 0.98
+    bullish_score += sma_bull_weight
+// ADX阈值从25降低到20
+if adx_value > 20
+    bullish_score += adx_bull_weight
+// 成交量条件
+if volume_factor > 0
+    bullish_score += volume_bull_weight
+
+// 更新后的空头评分计算 - 放宽条件以匹配Python版本
+bearish_score = 0.0
+// RSI高于高阈值*0.9 (放宽10%)
+if rsi > rsi_high * 0.9
+    bearish_score += rsi_bear_weight
+// IV低于低阈值*1.1 (放宽10%)
+if iv < iv_low * 1.1
+    bearish_score += iv_bear_weight
+// MACD条件放宽，任一条件成立即可
+if macdLine < signalLine * 1.05 or macd_change < 0
+    bearish_score += macd_bear_weight
+// SMA条件放宽，任一条件成立即可
+if close < sma_short * 1.02 or close < sma_long * 1.02
+    bearish_score += sma_bear_weight
+// ADX阈值从25降低到20
+if adx_value > 20
+    bearish_score += adx_bear_weight
+// 成交量条件
+if volume_factor > 0
+    bearish_score += volume_bear_weight
+
+// === 交易逻辑 ===
+if (bullish_score >= bullish_threshold)
+    strategy.entry("Long", strategy.long, comment="Long")
+
+if (bearish_score >= bearish_threshold)
+    strategy.entry("Short", strategy.short, comment="Short")  // 恢复做空交易功能
+
+// === 动态止盈止损 ===
+if strategy.position_size > 0  // 如果持有多头仓位
+    long_take = strategy.position_avg_price * (1 + hv / 100 * take_profit_mult)
+    long_stop = strategy.position_avg_price * (1 - hv / 100 * stop_loss_mult)
+    strategy.exit("Exit Long", from_entry="Long", stop=long_stop, limit=long_take)
+
+if strategy.position_size < 0  // 如果持有空头仓位
+    short_take = strategy.position_avg_price * (1 - hv / 100 * take_profit_mult)
+    short_stop = strategy.position_avg_price * (1 + hv / 100 * stop_loss_mult)
+    strategy.exit("Exit Short", from_entry="Short", stop=short_stop, limit=short_take)
+
+// === 图表显示 ===
+plot(bullish_score, "多头评分", color=color.green, linewidth=2)
+plot(bearish_score, "空头评分", color=color.red, linewidth=2)
+hline(bullish_threshold, "多头阈值", color=color.green, linestyle=hline.style_dashed)
+hline(bearish_threshold, "空头阈值", color=color.red, linestyle=hline.style_dashed)
+”
+
+以上是我设计的抓特斯拉这只股票反转信号的策略，是通过Pine Script Version 6编译，在TradingView上面运行的。
+我想优化几个内容：
+1. 策略在信号计算的时候，几个参数指标的权重是否是特斯拉这只股票的最优解
+2. 这些输入参数，怎么设置最能匹配特斯拉这只股票
+3. 优化止盈止损的策略逻辑
+
+我现在想基于上面原始 Pine Script 策通过：
+1.Vectorbt 开源版本（策略回测）
+2.Optuna（参数优化库，自动找到最优解）
+3.YFinance / Polars / Pandas（数据处理，提供数据载入、转换与预处理）
+4.使用 Python 3.10开发，并确定依赖文件可以相互兼容
+我会自己用Conda生成虚拟环境，只需要生成依赖文件清单让我安装即可。
+
+打包：
+生成一个Jupter Notebook步骤，用适合Jupter的格式编写在py文档里。因为Cursor原生并不支持.ipynb的直接编译，我会接下来使用jupyter Jupytext，把它转换成.ipynb文件，让我可以到Jupter Notebook中，让我运行回测 + 参数优化 + 图表。在接下来的修改过程中，如果有bug，也请直接在.py文件中修改，我会手动把它转换成.ipynb文件。
+
+目的：
+来实现最优权重的分配，以及最优的参数以达到指定时间范围内收益最大化；
+得到结果的同时，计算对应的夏普比率，以及最大回测；
+
+同时，也因为特斯拉是每一个季度发布一个财报，并且市场也有很多不确定性。我想能够随时调整回测的时间段，可以根据某一个时间段的回测结果，优化我的权重分配和输入参数。回测不同市场阶段，例如牛市，熊市，震荡。
+
+注意：
+1. VectorBT 使用最新版0.27.2
+2. NumPy 使用 1.26.x
+3. Pandas 使用2.2.x
+4. 你在编译的过程中如果对某些语句的用法不确定，可以告诉我，让我去查询官方文档，我会到网上讲官方文档放到档案库里。
+5. 如果策略本身有修改，或者优化，请根据Pine Script V6语言将新的策略输入到一个txt文档里
+6. 确保Python回测策略和Pine Script的策略一致
+7. Pine Script是有做空和做多两个方向的，在Python回测的过程中也要保证有做多和做空两个方向。做多和做空不能互为对方平仓和开仓的信号。
+8. 如果生成测试文件，请在测试结束后删除，保持文件夹更加整洁，不要有干扰。

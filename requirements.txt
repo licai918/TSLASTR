@@ -12,6 +12,4 @@ pandas-ta
 numba
 scikit-learn 
 jupyter
-dask
-distributed
 joblib

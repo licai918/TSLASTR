@@ -1,0 +1,91 @@
+如何火力全开运行回测：
+
+
+# 优化CPU使用率进行策略回测
+
+Cursor环境确实在CPU利用率上有一定限制。如果您希望CPU火力全开进行回测优化，有以下几种方法：
+
+## 1. 在独立终端中运行
+
+```bash
+python tsla_strategy_backtest.py
+```
+
+直接在系统终端或命令提示符中运行，而不是在Cursor的集成终端中。这样程序可以使用系统分配的全部资源。
+
+## 2. 优化Optuna并行设置
+
+Optuna默认使用进程池进行并行，可以尝试指定不同的并行后端：
+
+```python
+# 修改优化部分代码
+from joblib import parallel_backend
+
+with parallel_backend('loky', n_jobs=-1):  # 或尝试'threading'、'multiprocessing'
+    study.optimize(objective, n_trials=N_TRIALS)
+```
+
+## 3. 手动设置并行进程数
+
+可能系统有更多CPU核心，但`n_jobs=-1`实际调用的核心数不够，手动指定一个较高的值：
+
+```python
+# 获取并显示系统CPU核心数
+import os
+cpu_count = os.cpu_count()
+print(f"系统CPU核心数: {cpu_count}")
+
+# 使用接近但略少于总核心数的值
+study.optimize(objective, n_trials=N_TRIALS, n_jobs=cpu_count-1)
+```
+
+## 4. 使用dask加速计算
+
+对于大规模并行计算，考虑使用dask：
+
+```python
+# 安装：pip install dask distributed
+from dask.distributed import Client
+
+# 在程序开始处添加
+client = Client(n_workers=os.cpu_count())  # 创建本地集群
+# 然后正常运行程序
+```
+
+## 5. 调整Python程序的优先级
+
+在Windows中以高优先级运行:
+
+```bash
+start /high python tsla_strategy_backtest.py
+```
+
+在Linux/Mac中:
+
+```bash
+nice -n -20 python tsla_strategy_backtest.py  # 需要sudo权限
+```
+
+## 6. 优化并行任务粒度
+
+目前代码中Optuna执行的每个trial相对独立，可以调整让每个trial处理更小的任务，增加并行度：
+
+```python
+# 修改objective函数，将大任务分解为多个小任务
+def objective(trial):
+    # ... 现有代码 ...
+    # 可以考虑在这里进一步并行化内部计算
+    return metric_value
+```
+
+## 7. 查看进程管理器并诊断
+
+运行时打开任务管理器(Windows)或活动监视器(Mac)，观察Python进程的资源使用情况，确认是否有其他限制因素。
+
+## 8. 使用专用IDE或环境
+
+将代码从Cursor移到专门的IDE或直接在Jupyter环境中运行可能也会提高资源利用率。
+
+---
+
+如果您还需要针对代码做特定的并行优化，我可以提供更详细的修改方案。
