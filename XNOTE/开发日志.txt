@@ -1,0 +1,23 @@
+2025/04/05
+在Pine Script中：
+    计算综合评分差额: score_difference = bullish_score - bearish_score
+    多头信号: if score_difference >= bull_score_threshold
+    空头信号: if score_difference <= bear_score_threshold
+在Python回测代码中：
+    计算评分差额: indicator_df['score_difference'] = indicator_df['bullish_score'] - indicator_df['bearish_score']
+    多头信号: long_entries = (indicator_df['score_difference'] >= params['bull_score_threshold'])
+    空头信号: short_entries = (indicator_df['score_difference'] <= params['bear_score_threshold'])
+默认参数设置：
+    多头差额阈值(bull_score_threshold): 0.1
+    空头差额阈值(bear_score_threshold): -0.1
+Optuna优化范围：
+    多头差额阈值(bull_score_threshold): -0.1 到 0.7
+    空头差额阈值(bear_score_threshold): -0.7 到 -0.1
+关键修改总结：
+使用了带有独立参数的双阈值差额机制，替代了原来的单一阈值差额机制
+多头差额阈值可以取负值，空头差额阈值也可以取负值，这种灵活性使得策略可以更好地适应市场
+这样修改后，即使多头评分通常小于空头评分，通过适当设置阈值（尤其是允许负值），依然能产生多头信号
+双阈值机制还可以解决原来单一阈值可能导致的信号不平衡问题
+这个新策略能够更灵活地处理各种市场环境，特别是当多头和空头评分有系统性偏差时，通过调整各自的阈值可以达到更好的平衡。
+
+**

@@ -53,7 +53,7 @@ print(f"系统CPU核心数: {cpu_count}")
 
 # %%
 # --- 回测和数据参数 ---
-TICKER = "SHOP"
+TICKER = "TSLA"
 START_DATE = "2024-12-17" # 修改为更合理的历史日期范围
 END_DATE = "2025-04-04"   # 修改为当前或过去的日期
 INTERVAL = "1h"          # 数据频率 ('1d', '1h', '30m', etc.) - 从'2h'改为'1h'，因为YF不支持2h间隔
@@ -76,8 +76,8 @@ initial_params = {
     'iv_high_percentile': 70,     # 从80改为70，更容易触发高IV信号
     'take_profit_mult': 2.0,
     'stop_loss_mult': 2.0,
-    'bullish_threshold': 0.4,     # 从0.6改为0.4，降低多头信号阈值
-    'bearish_threshold': 0.4,     # 从0.6改为0.4，降低空头信号阈值
+    'bull_score_threshold': 0.1,     # 多头差额阈值，允许负值
+    'bear_score_threshold': -0.1,    # 空头差额阈值，允许负值
     # --- 移除SMA和ADX的权重，保留其他权重参数 ---
     'rsi_bull_weight': 0.35,       # 增加权重以弥补移除的SMA和ADX
     'iv_bull_weight': 0.25,        # 增加权重以弥补移除的SMA和ADX
@@ -95,7 +95,7 @@ PYRAMIDING = 1 # 允许的金字塔加仓次数
 PCT_OF_EQUITY = 100 # 每次交易使用的资金比例
 
 # --- Optuna 优化设置 ---
-N_TRIALS = 5000 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
+N_TRIALS = 15000 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
 OPTIMIZATION_METRIC = 'Total Return [%]' # 用于优化的目标指标 ('Total Return [%]', 'Sharpe Ratio', 'Max Drawdown [%]')
 
 # %% [markdown]
@@ -354,6 +354,7 @@ def calculate_scores_nb(
 def generate_signals(indicator_df: pd.DataFrame, params: dict) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """
     根据评分生成入场信号，包括多头和空头信号。
+    使用双阈值差额评分机制生成交易信号，与更新后的Pine Script策略保持一致。
     返回多头入场、多头离场、空头入场、空头离场信号。
     """
     # 确保所有数组都转换为numpy的float64类型，以避免Numba类型错误
@@ -405,10 +406,16 @@ def generate_signals(indicator_df: pd.DataFrame, params: dict) -> tuple[pd.Serie
 
     indicator_df['bullish_score'] = bullish_scores
     indicator_df['bearish_score'] = bearish_scores
+    
+    # 计算评分差额
+    indicator_df['score_difference'] = indicator_df['bullish_score'] - indicator_df['bearish_score']
 
-    # 生成交易信号
-    long_entries = (indicator_df['bullish_score'] >= params['bullish_threshold'])
-    short_entries = (indicator_df['bearish_score'] >= params['bearish_threshold'])
+    # 生成交易信号 - 基于双阈值差额评分机制
+    # 多头信号: 评分差额 >= 多头差额阈值
+    long_entries = (indicator_df['score_difference'] >= params['bull_score_threshold'])
+    
+    # 空头信号: 评分差额 <= 空头差额阈值
+    short_entries = (indicator_df['score_difference'] <= params['bear_score_threshold'])
     
     # 正确实现Pine Script策略的退出逻辑
     # 在Pine Script中，退出信号是通过止盈止损设置的，而不是通过相反的信号
@@ -619,7 +626,7 @@ try:
         go.Scatter(
             x=initial_indicator_df.index, 
             y=initial_indicator_df['bullish_score'],
-            name='Bullish Score', 
+            name='多头评分', 
             line=dict(color='green')
         )
     )
@@ -628,22 +635,39 @@ try:
         go.Scatter(
             x=initial_indicator_df.index, 
             y=initial_indicator_df['bearish_score'],
-            name='Bearish Score', 
+            name='空头评分', 
             line=dict(color='red')
+        )
+    )
+    
+    # 添加评分差额线
+    fig_scores.add_trace(
+        go.Scatter(
+            x=initial_indicator_df.index, 
+            y=initial_indicator_df['score_difference'],
+            name='评分差额', 
+            line=dict(color='blue')
         )
     )
     
     # 添加阈值线
     fig_scores.add_hline(
-        y=initial_params['bullish_threshold'], 
+        y=initial_params['bull_score_threshold'], 
         line=dict(color='green', dash='dash'), 
-        name='Bull Thresh'
+        name='多头差额阈值'
     )
     
     fig_scores.add_hline(
-        y=initial_params['bearish_threshold'], 
+        y=initial_params['bear_score_threshold'], 
         line=dict(color='red', dash='dash'), 
-        name='Bear Thresh'
+        name='空头差额阈值'
+    )
+    
+    # 添加零轴线
+    fig_scores.add_hline(
+        y=0, 
+        line=dict(color='gray', dash='dot'), 
+        name='零轴'
     )
     
     # 更新布局
@@ -696,8 +720,9 @@ def objective(trial: optuna.Trial) -> float:
         'take_profit_mult': trial.suggest_float('take_profit_mult', 0.5, 5.0, step=0.25),
         'stop_loss_mult': trial.suggest_float('stop_loss_mult', 0.5, 5.0, step=0.25),
 
-        'bullish_threshold': trial.suggest_float('bullish_threshold', 0.2, 0.7, step=0.05),
-        'bearish_threshold': trial.suggest_float('bearish_threshold', 0.2, 0.7, step=0.05),
+        # 双阈值差额机制
+        'bull_score_threshold': trial.suggest_float('bull_score_threshold', -0.1, 0.7, step=0.05), # 允许负值作为多头阈值
+        'bear_score_threshold': trial.suggest_float('bear_score_threshold', -0.7, -0.1, step=0.05), # 负值范围，从大到小
 
         # --- 移除SMA和ADX权重，保留其他权重参数 ---
         'rsi_bull_weight': trial.suggest_float('rsi_bull_weight', 0.2, 0.5, step=0.05),
@@ -917,7 +942,7 @@ try:
         go.Scatter(
             x=final_indicator_df.index, 
             y=final_indicator_df['bullish_score'],
-            name='Bullish Score', 
+            name='多头评分', 
             line=dict(color='green')
         )
     )
@@ -926,22 +951,39 @@ try:
         go.Scatter(
             x=final_indicator_df.index, 
             y=final_indicator_df['bearish_score'],
-            name='Bearish Score', 
+            name='空头评分', 
             line=dict(color='red')
         )
     )
     
+    # 添加评分差额线
+    fig_final_scores.add_trace(
+        go.Scatter(
+            x=final_indicator_df.index, 
+            y=final_indicator_df['score_difference'],
+            name='评分差额', 
+            line=dict(color='blue')
+        )
+    )
+
     # 添加阈值线
     fig_final_scores.add_hline(
-        y=best_params_complete['bullish_threshold'], 
+        y=best_params_complete['bull_score_threshold'], 
         line=dict(color='green', dash='dash'), 
-        name='Bull Thresh'
+        name='多头差额阈值'
     )
-    
+
     fig_final_scores.add_hline(
-        y=best_params_complete['bearish_threshold'], 
+        y=best_params_complete['bear_score_threshold'], 
         line=dict(color='red', dash='dash'), 
-        name='Bear Thresh'
+        name='空头差额阈值'
+    )
+
+    # 添加零轴线
+    fig_final_scores.add_hline(
+        y=0, 
+        line=dict(color='gray', dash='dot'), 
+        name='零轴'
     )
 
     # 更新主图布局

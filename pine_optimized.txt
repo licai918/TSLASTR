@@ -1,6 +1,6 @@
 //@version=6
-//(Updated 2025/04/05 - 超简化版本：移除SMA和ADX权重)
-strategy("Enhanced Tesla Reversal Strategy v10 (Ultra-Simplified)", overlay=true, pyramiding=2, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
+//(Updated 2025/04/07 - 双阈值差额评分机制：多空信号使用各自的差额阈值)
+strategy("Enhanced Tesla Reversal Strategy v12 (Dual Threshold)", overlay=true, pyramiding=2, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
 
 // === 输入参数 ===
 // 这里使用优化后的参数值（示例值，具体应使用Optuna优化结果）
@@ -22,8 +22,10 @@ iv_low_percentile   = input.int(30, "IV低分位数")
 iv_high_percentile  = input.int(70, "IV高分位数")
 take_profit_mult = input.float(2.0, "止盈波动率倍数", minval=0.5)
 stop_loss_mult   = input.float(2.0, "止损波动率倍数", minval=0.5)
-bullish_threshold = input.float(0.4, "多头评分阈值", minval=0.0, maxval=1.0)
-bearish_threshold = input.float(0.4, "空头评分阈值", minval=0.0, maxval=1.0)
+
+// 新的多空差额阈值，分别设置多头和空头阈值
+bull_score_threshold = input.float(0.1, "多头差额阈值", minval=-1.0, maxval=1.0)
+bear_score_threshold = input.float(-0.1, "空头差额阈值", minval=-1.0, maxval=1.0)
 
 // === 权重设置（超简化版，仅保留RSI, IV, MACD和Volume权重） ===
 rsi_bull_weight    = input.float(0.35, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
@@ -102,12 +104,17 @@ if adx_value > 20
     if volume_spike and volume_change < 0  // 成交量峰值且下降
         bearish_score += volume_bear_weight * math.min(volume_strength, 3.0) / 3.0
 
-// === 交易逻辑 ===
-if (bullish_score >= bullish_threshold)
+// === 计算综合评分差额 ===
+score_difference = bullish_score - bearish_score
+
+// === 交易逻辑 (修改为基于双阈值差额机制) ===
+// 多头信号: 评分差额 >= 多头差额阈值
+if score_difference >= bull_score_threshold
     strategy.entry("Long", strategy.long, comment="Long")
 
-if (bearish_score >= bearish_threshold)
-    strategy.entry("Short", strategy.short, comment="Short")  // 恢复做空交易功能
+// 空头信号: 评分差额 <= 空头差额阈值
+if score_difference <= bear_score_threshold
+    strategy.entry("Short", strategy.short, comment="Short")
 
 // === 动态止盈止损 ===
 if strategy.position_size > 0  // 如果持有多头仓位
@@ -123,8 +130,10 @@ if strategy.position_size < 0  // 如果持有空头仓位
 // === 图表显示 ===
 plot(bullish_score, "多头评分", color=color.green, linewidth=2)
 plot(bearish_score, "空头评分", color=color.red, linewidth=2)
-hline(bullish_threshold, "多头阈值", color=color.green, linestyle=hline.style_dashed)
-hline(bearish_threshold, "空头阈值", color=color.red, linestyle=hline.style_dashed)
+plot(score_difference, "评分差额", color=color.blue, linewidth=2)
+hline(bull_score_threshold, "多头差额阈值", color=color.green, linestyle=hline.style_dashed)
+hline(bear_score_threshold, "空头差额阈值", color=color.red, linestyle=hline.style_dashed)
+hline(0, "零轴", color=color.gray, linestyle=hline.style_dotted)
 
 // 显示Volume Spike
 plot(volume_spike ? high * 1.01 : na, "成交量峰值", style=plot.style_circles, color=color.yellow, linewidth=3) 
