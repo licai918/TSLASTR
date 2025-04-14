@@ -5,47 +5,47 @@ strategy("Enhanced Tesla Reversal Strategy v13 (Dynamic ADX)", overlay=true, pyr
 
 // === 输入参数 ===
 // 这里使用优化后的参数值（示例值，具体应使用Optuna优化结果）
-rsi_length       = input.int(7, "RSI长度", minval=1)
-iv_length        = input.int(126, "隐含波动率周期", minval=50)
-macd_fast        = input.int(8, "MACD快线周期")
-macd_slow        = input.int(17, "MACD慢线周期")
-macd_signal      = input.int(9, "MACD信号周期")
-adx_length       = input.int(14, "ADX长度") // ADX计算周期
-volume_ma_period = input.int(20, "成交量均线周期")
+rsi_length = input.int(5, "RSI长度", minval=1)
+iv_length = input.int(110, "隐含波动率周期", minval=50)
+macd_fast = input.int(7, "MACD快线周期")
+macd_slow = input.int(28, "MACD慢线周期")
+macd_signal = input.int(9, "MACD信号周期")
+adx_length = input.int(20, "ADX长度") // ADX计算周期
+volume_ma_period = input.int(34, "成交量均线周期")
 
 // Volume Spike参数
-volume_spike_window = input.int(20, "成交量峰值窗口", minval=5)
+volume_spike_window = input.int(27, "成交量峰值窗口", minval=5)
 volume_spike_mult = input.float(2.0, "成交量峰值倍数", minval=1.2)
 
-rsi_low_percentile  = input.int(30, "RSI低分位数")
-rsi_high_percentile = input.int(70, "RSI高分位数")
-iv_low_percentile   = input.int(30, "IV低分位数")
-iv_high_percentile  = input.int(70, "IV高分位数")
+rsi_low_percentile = input.int(29, "RSI低分位数")
+rsi_high_percentile = input.int(68, "RSI高分位数")
+iv_low_percentile = input.int(26, "IV低分位数")
+iv_high_percentile = input.int(76, "IV高分位数")
 take_profit_mult = input.float(2.0, "止盈波动率倍数", minval=0.5)
-stop_loss_mult   = input.float(2.0, "止损波动率倍数", minval=0.5)
+stop_loss_mult = input.float(1.75, "止损波动率倍数", minval=0.5)
 
 // 新的多空差额阈值，分别设置多头和空头阈值
-bull_score_threshold = input.float(0.1, "多头差额阈值", minval=-1.0, maxval=1.0)
-bear_score_threshold = input.float(-0.1, "空头差额阈值", minval=-1.0, maxval=1.0)
+bull_score_threshold = input.float(0.55, "多头差额阈值", minval=-1.0, maxval=1.0)
+bear_score_threshold = input.float(-0.25, "空头差额阈值", minval=-1.0, maxval=1.0)
 
 // === 动态 ADX 过滤器参数 ===
-adx_filter_lookback = input.int(250, "ADX动态阈值回看期", minval=50)
-adx_filter_percentile = input.int(25, "ADX基础阈值分位数", minval=5, maxval=50)
+adx_filter_lookback = input.int(150, "ADX动态阈值回看期", minval=50)
+adx_filter_percentile = input.int(37, "ADX基础阈值分位数", minval=5, maxval=50)
 adx_volatility_period = input.int(20, "ADX波动性周期", minval=5)
-adx_threshold_min = input.float(15.0, "ADX最小动态阈值", minval=5.0)
-adx_threshold_max = input.float(25.0, "ADX最大动态阈值", minval=15.0)
-adx_volatility_impact = input.float(0.5, "ADX波动性影响因子", minval=0.0, maxval=1.0, step=0.1)
+adx_threshold_min = input.float(16.0, "ADX最小动态阈值", minval=5.0)
+adx_threshold_max = input.float(21.0, "ADX最大动态阈值", minval=15.0)
+adx_volatility_impact = input.float(0.1, "ADX波动性影响因子", minval=0.0, maxval=1.0, step=0.1)
 
 // === 权重设置（超简化版，仅保留RSI, IV, MACD和Volume权重） ===
-rsi_bull_weight    = input.float(0.35, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
-iv_bull_weight     = input.float(0.25, "IV多头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
-macd_bull_weight   = input.float(0.3, "MACD多头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
-volume_bull_weight = input.float(0.1, "成交量多头权重", minval=0.0, maxval=0.3, step=0.05)
+rsi_bull_weight = input.float(0.35, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
+iv_bull_weight = input.float(0.25, "IV多头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
+macd_bull_weight = input.float(0.5, "MACD多头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
+volume_bull_weight = input.float(0.15, "成交量多头权重", minval=0.0, maxval=0.3, step=0.05)
 
-rsi_bear_weight    = input.float(0.35, "RSI空头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
-iv_bear_weight     = input.float(0.25, "IV空头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
-macd_bear_weight   = input.float(0.3, "MACD空头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
-volume_bear_weight = input.float(0.1, "成交量空头权重", minval=0.0, maxval=0.3, step=0.05)
+rsi_bear_weight = input.float(0.25, "RSI空头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
+iv_bear_weight = input.float(0.4, "IV空头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
+macd_bear_weight = input.float(0.3, "MACD空头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
+volume_bear_weight = input.float(0.05, "成交量空头权重", minval=0.0, maxval=0.3, step=0.05)
 
 // === 指标计算 ===
 rsi = ta.rsi(close, rsi_length)
@@ -165,7 +165,7 @@ hline(bear_score_threshold, "空头差额阈值", color=color.red, linestyle=hli
 hline(0, "零轴", color=color.gray, linestyle=hline.style_dotted)
 
 // 显示动态 ADX 阈值和 ADX 值
-hline(adx_thresh_val, "动态ADX阈值", color=color.orange, linestyle=plot.style_linebr)
+plot(adx_thresh_val, "动态ADX阈值", color=color.orange, linestyle=plot.style_linebr)
 plot(adx_value, "ADX值", color=color.purple, linewidth=1)
 
 // 显示Volume Spike

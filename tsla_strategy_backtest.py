@@ -20,6 +20,7 @@ import pandas_ta as ta # 使用 pandas_ta 来简化指标计算
 import warnings
 from joblib import parallel_backend
 import os
+import re # 新增：导入正则表达式库
 import time
 from tqdm import tqdm
 from datetime import timedelta
@@ -54,8 +55,8 @@ print(f"系统CPU核心数: {cpu_count}")
 # %%
 # --- 回测和数据参数 ---
 TICKER = "TSLA"
-START_DATE = "2024-12-17" # 修改为更合理的历史日期范围
-END_DATE = "2025-04-04"   # 修改为当前或过去的日期
+START_DATE = "2025-03-17" # 修改为更合理的历史日期范围
+END_DATE = "2025-04-11"   # 修改为当前或过去的日期
 INTERVAL = "1h"          # 数据频率 ('1d', '1h', '30m', etc.) - 从'2h'改为'1h'，因为YF不支持2h间隔
 
 # --- 策略默认参数 (来自 Pine Script) ---
@@ -87,6 +88,13 @@ initial_params = {
     'iv_bear_weight': 0.25,        # 增加权重以弥补移除的SMA和ADX
     'macd_bear_weight': 0.3,       # 增加权重以弥补移除的SMA和ADX
     'volume_bear_weight': 0.1,
+    # --- 动态 ADX 过滤器参数 ---
+    'adx_filter_lookback': 250,       # 动态阈值回看期
+    'adx_filter_percentile': 25,      # 基础阈值分位数
+    'adx_volatility_period': 20,      # ADX波动性计算周期
+    'adx_threshold_min': 15.0,        # 最小动态阈值
+    'adx_threshold_max': 25.0,        # 最大动态阈值
+    'adx_volatility_impact': 0.5      # 波动性影响因子 (0 to 1)
 }
 
 # --- vectorbt 回测设置 ---
@@ -95,7 +103,7 @@ PYRAMIDING = 1 # 允许的金字塔加仓次数
 PCT_OF_EQUITY = 100 # 每次交易使用的资金比例
 
 # --- Optuna 优化设置 ---
-N_TRIALS = 15000 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
+N_TRIALS = 500 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
 OPTIMIZATION_METRIC = 'Total Return [%]' # 用于优化的目标指标 ('Total Return [%]', 'Sharpe Ratio', 'Max Drawdown [%]')
 
 # %% [markdown]
@@ -164,6 +172,7 @@ def calculate_indicators(data: pd.DataFrame, params: dict) -> pd.DataFrame:
     """
     计算所有策略所需的指标。
     移除SMA指标，只使用MACD和VOLUME SPIKE作为主要技术指标。
+    添加动态ADX阈值计算。
     """
     df = data.copy()
     
@@ -171,6 +180,44 @@ def calculate_indicators(data: pd.DataFrame, params: dict) -> pd.DataFrame:
     if df.empty:
         print("警告：数据为空，无法计算指标")
         return df
+
+    # 内部函数：计算动态ADX阈值
+    def calculate_dynamic_adx_threshold(
+        adx_series: pd.Series,
+        lookback: int,
+        percentile: int,
+        vol_period: int,
+        min_thresh: float,
+        max_thresh: float,
+        vol_impact: float
+    ) -> pd.Series:
+        """
+        计算动态ADX阈值，基于历史分位数并受波动性调整。
+        """
+        # 1. 基础阈值（历史分位数）
+        base_threshold = adx_series.rolling(window=lookback, min_periods=max(1, lookback//2)).quantile(percentile / 100.0)
+
+        # 2. 计算ADX的波动性（标准差）和归一化波动性
+        adx_volatility = adx_series.rolling(window=vol_period, min_periods=max(1, vol_period//2)).std()
+        adx_mean = adx_series.rolling(window=vol_period, min_periods=max(1, vol_period//2)).mean()
+        # 避免除以零
+        adx_mean[adx_mean == 0] = 1e-6
+        adx_volatility_norm = adx_volatility / adx_mean
+
+        # 3. 调整阈值：波动性越大，阈值越低（允许更多信号），但受vol_impact限制
+        # 修正逻辑：波动性越大，趋势越不稳定，应提高阈值过滤掉更多震荡信号
+        # 调整因子: (1 + 归一化波动率 * 影响因子)，限制因子范围
+        adjustment_factor = (1 + adx_volatility_norm * vol_impact).clip(1.0, 1.0 + vol_impact) # 至少为1，最大为1+vol_impact
+        dynamic_threshold = base_threshold * adjustment_factor
+
+        # 4. 确保阈值在预设的最小/最大范围内
+        dynamic_threshold = dynamic_threshold.clip(lower=min_thresh, upper=max_thresh)
+
+        # 填充初始NaN
+        dynamic_threshold.fillna(method='bfill', inplace=True)
+        dynamic_threshold.fillna(method='ffill', inplace=True)
+
+        return dynamic_threshold
 
     # --- 标准指标 (使用 pandas-ta) ---
     df['rsi'] = ta.rsi(df['close'], length=params['rsi_length'])
@@ -201,17 +248,16 @@ def calculate_indicators(data: pd.DataFrame, params: dict) -> pd.DataFrame:
         
     df['macd_change'] = df['macd_line'].diff() # MACD 线的变化
 
-    # 修复: 使用正确的 adx 函数并添加错误处理
+    # --- ADX 计算 ---
     try:
-        adx = ta.adx(df['high'], df['low'], df['close'], length=params['adx_length'])
-        if adx is not None:
-            df['adx'] = adx[f'ADX_{params["adx_length"]}']
-            df['di_plus'] = adx[f'DMP_{params["adx_length"]}']
-            df['di_minus'] = adx[f'DMN_{params["adx_length"]}']
+        adx_indicator = ta.adx(df['high'], df['low'], df['close'], length=params['adx_length'])
+        if adx_indicator is not None:
+            df['adx'] = adx_indicator[f'ADX_{params["adx_length"]}']
+            df['di_plus'] = adx_indicator[f'DMP_{params["adx_length"]}']
+            df['di_minus'] = adx_indicator[f'DMN_{params["adx_length"]}']
         else:
-            print("警告：ADX计算返回None，使用替代方法计算ADX")
-            # 可以添加备选计算方法，或者设置默认值
-            df['adx'] = 25.0  # 设置一个默认值
+            print("警告：ADX计算返回None，设置默认值")
+            df['adx'] = 25.0
             df['di_plus'] = 20.0
             df['di_minus'] = 20.0
     except Exception as e:
@@ -220,7 +266,18 @@ def calculate_indicators(data: pd.DataFrame, params: dict) -> pd.DataFrame:
         df['di_plus'] = 20.0
         df['di_minus'] = 20.0
     
-    # 计算成交量均线 (必需，用于Volume Spike指标)
+    # --- 计算动态ADX阈值 ---
+    df['dynamic_adx_thresh'] = calculate_dynamic_adx_threshold(
+        df['adx'],
+        params['adx_filter_lookback'],
+        params['adx_filter_percentile'],
+        params['adx_volatility_period'],
+        params['adx_threshold_min'],
+        params['adx_threshold_max'],
+        params['adx_volatility_impact']
+    )
+
+    # --- 成交量相关指标 ---
     df['volume_ma'] = ta.sma(df['volume'], length=params['volume_ma_period'])
     
     # Volume Spike指标 - 成交量突破 (作为主要技术指标保留)
@@ -279,6 +336,7 @@ def calculate_scores_nb(
     macd_signal: np.ndarray,
     macd_change: np.ndarray,
     adx: np.ndarray,
+    dynamic_adx_thresh: np.ndarray,
     volume_ratio: np.ndarray,
     volume_spike: np.ndarray,
     volume_strength: np.ndarray,
@@ -294,6 +352,7 @@ def calculate_scores_nb(
     Numba JIT 编译的函数，用于快速计算多头和空头评分。
     简化版本: 移除SMA指标，只使用MACD和VOLUME SPIKE作为主要技术指标。
     ADX仅作为过滤器使用，但不计入权重得分。
+    使用动态ADX阈值进行过滤。
     """
     n = len(close)
     bullish_scores = np.full(n, 0.0)
@@ -304,8 +363,8 @@ def calculate_scores_nb(
         bull_score = 0.0
         bear_score = 0.0
         
-        # ADX过滤器 - 只有当ADX > 20时才计算评分
-        if adx[i] > 20:
+        # 动态ADX过滤器 - 只有当ADX > 动态阈值时才计算评分
+        if adx[i] > dynamic_adx_thresh[i]:
             # Volume Spike - 使用成交量强度和峰值
             volume_factor = 0.0
             if volume_spike[i] and volume_change[i] > 0:  # 成交量峰值且上升
@@ -366,6 +425,7 @@ def generate_signals(indicator_df: pd.DataFrame, params: dict) -> tuple[pd.Serie
     macd_signal_arr = indicator_df['macd_signal'].values.astype(np.float64)
     macd_change_arr = indicator_df['macd_change'].values.astype(np.float64)
     adx_arr = indicator_df['adx'].values.astype(np.float64)
+    dynamic_adx_thresh_arr = indicator_df['dynamic_adx_thresh'].values.astype(np.float64)
     
     # 移除SMA相关数组
     # 仍然保留volume_ma_arr，因为Volume Spike需要它
@@ -392,6 +452,7 @@ def generate_signals(indicator_df: pd.DataFrame, params: dict) -> tuple[pd.Serie
         macd_signal_arr,
         macd_change_arr,
         adx_arr,
+        dynamic_adx_thresh_arr,
         volume_ratio_arr,
         volume_spike_arr,
         volume_strength_arr,
@@ -670,12 +731,38 @@ try:
         name='零轴'
     )
     
+    # 添加动态 ADX 阈值线
+    fig_scores.add_trace(
+        go.Scatter(
+            x=initial_indicator_df.index,
+            y=initial_indicator_df['dynamic_adx_thresh'],
+            name='动态ADX阈值',
+            line=dict(color='orange', dash='longdash')
+        )
+    )
+    # 添加原始 ADX 线
+    fig_scores.add_trace(
+        go.Scatter(
+            x=initial_indicator_df.index,
+            y=initial_indicator_df['adx'],
+            name='ADX值',
+            line=dict(color='purple', width=1),
+            yaxis="y2" # 使用第二个Y轴显示ADX
+        )
+    )
+    
     # 更新布局
     fig_scores.update_layout(
-        title=f"{TICKER} 评分指标 ({START_DATE} to {END_DATE})",
+        title=f"{TICKER} 评分与ADX指标 ({START_DATE} to {END_DATE})", # 更新标题
         xaxis_title="日期",
-        yaxis_title="评分",
-        height=400
+        yaxis_title="评分/动态阈值", # 更新Y轴标题
+        yaxis2=dict( # 配置第二个Y轴
+            title="ADX值",
+            overlaying="y",
+            side="right",
+            showgrid=False
+        ),
+        height=500 # 增加图表高度
     )
     
     # 显示两个图表
@@ -696,18 +783,19 @@ def objective(trial: optuna.Trial) -> float:
     Optuna 目标函数 - 结合总回报与最大回撤的优化目标。
     高回报和低回撤将获得更高的评分。
     移除SMA和ADX的权重参数。
+    添加动态ADX过滤参数。
     """
     trial_start_time = time.time()
     
     # --- 建议参数范围 ---
     params = {
         'rsi_length': trial.suggest_int('rsi_length', 5, 20),
-        'iv_length': trial.suggest_int('iv_length', 60, 250, step=10), 
+        'iv_length': trial.suggest_int('iv_length', 60, 250, step=10),
         'macd_fast': trial.suggest_int('macd_fast', 5, 15),
         'macd_slow': trial.suggest_int('macd_slow', 15, 35),
-        'adx_length': trial.suggest_int('adx_length', 10, 25),  # 保留ADX计算，但不用于权重评分
+        'adx_length': trial.suggest_int('adx_length', 10, 25),  # ADX计算周期
         'volume_ma_period': trial.suggest_int('volume_ma_period', 10, 50),
-        
+
         # Volume Spike参数
         'volume_spike_window': trial.suggest_int('volume_spike_window', 10, 30),
         'volume_spike_mult': trial.suggest_float('volume_spike_mult', 1.5, 3.0, step=0.25),
@@ -724,7 +812,7 @@ def objective(trial: optuna.Trial) -> float:
         'bull_score_threshold': trial.suggest_float('bull_score_threshold', -0.1, 0.7, step=0.05), # 允许负值作为多头阈值
         'bear_score_threshold': trial.suggest_float('bear_score_threshold', -0.7, -0.1, step=0.05), # 负值范围，从大到小
 
-        # --- 移除SMA和ADX权重，保留其他权重参数 ---
+        # --- 权重参数 ---
         'rsi_bull_weight': trial.suggest_float('rsi_bull_weight', 0.2, 0.5, step=0.05),
         'iv_bull_weight': trial.suggest_float('iv_bull_weight', 0.1, 0.4, step=0.05),
         'macd_bull_weight': trial.suggest_float('macd_bull_weight', 0.2, 0.5, step=0.05),
@@ -734,6 +822,14 @@ def objective(trial: optuna.Trial) -> float:
         'iv_bear_weight': trial.suggest_float('iv_bear_weight', 0.1, 0.4, step=0.05),
         'macd_bear_weight': trial.suggest_float('macd_bear_weight', 0.2, 0.5, step=0.05),
         'volume_bear_weight': trial.suggest_float('volume_bear_weight', 0.05, 0.3, step=0.05),
+
+        # --- 动态 ADX 过滤器参数 ---
+        'adx_filter_lookback': trial.suggest_int('adx_filter_lookback', 100, 300, step=50),
+        'adx_filter_percentile': trial.suggest_int('adx_filter_percentile', 15, 40),
+        'adx_volatility_period': trial.suggest_int('adx_volatility_period', 10, 40, step=5),
+        'adx_threshold_min': trial.suggest_float('adx_threshold_min', 10.0, 20.0, step=1.0),
+        'adx_threshold_max': trial.suggest_float('adx_threshold_max', 20.0, 35.0, step=1.0),
+        'adx_volatility_impact': trial.suggest_float('adx_volatility_impact', 0.1, 1.0, step=0.1),
     }
     # 确保 MACD 慢线 > 快线
     if params['macd_slow'] <= params['macd_fast']:
@@ -870,6 +966,15 @@ for key, value in best_params.items():
 # 添加固定参数信息
 print(f"  macd_signal: {best_params_complete['macd_signal']}")
 
+# 添加动态ADX参数信息
+print("  --- Dynamic ADX Filter ---")
+print(f"  adx_filter_lookback: {best_params_complete['adx_filter_lookback']}")
+print(f"  adx_filter_percentile: {best_params_complete['adx_filter_percentile']}")
+print(f"  adx_volatility_period: {best_params_complete['adx_volatility_period']}")
+print(f"  adx_threshold_min: {best_params_complete['adx_threshold_min']}")
+print(f"  adx_threshold_max: {best_params_complete['adx_threshold_max']}")
+print(f"  adx_volatility_impact: {best_params_complete['adx_volatility_impact']}")
+
 
 # %% [markdown]
 # ## 11. 使用最优参数进行最终回测 (Final Backtest with Best Parameters)
@@ -986,6 +1091,26 @@ try:
         name='零轴'
     )
 
+    # 添加动态 ADX 阈值线
+    fig_final_scores.add_trace(
+        go.Scatter(
+            x=final_indicator_df.index,
+            y=final_indicator_df['dynamic_adx_thresh'],
+            name='动态ADX阈值',
+            line=dict(color='orange', dash='longdash')
+        )
+    )
+    # 添加原始 ADX 线
+    fig_final_scores.add_trace(
+        go.Scatter(
+            x=final_indicator_df.index,
+            y=final_indicator_df['adx'],
+            name='ADX值',
+            line=dict(color='purple', width=1),
+            yaxis="y2" # 使用第二个Y轴显示ADX
+        )
+    )
+
     # 更新主图布局
     fig_final.update_layout(
         title=f"{TICKER} 优化后回测结果 ({START_DATE} to {END_DATE}) - Best Value: {study.best_value:.2f} ({OPTIMIZATION_METRIC})"
@@ -993,10 +1118,16 @@ try:
     
     # 更新评分图布局
     fig_final_scores.update_layout(
-        title=f"{TICKER} 优化后评分指标 ({START_DATE} to {END_DATE})",
+        title=f"{TICKER} 优化后评分与ADX指标 ({START_DATE} to {END_DATE})", # 更新标题
         xaxis_title="日期",
-        yaxis_title="评分",
-        height=400
+        yaxis_title="评分/动态阈值", # 更新Y轴标题
+        yaxis2=dict( # 配置第二个Y轴
+            title="ADX值",
+            overlaying="y",
+            side="right",
+            showgrid=False
+        ),
+        height=500 # 增加图表高度
     )
     
     # 显示两个图表
@@ -1034,6 +1165,88 @@ if optuna.visualization.is_available():
 
 else:
     print("Optuna 可视化不可用。请安装 matplotlib: pip install matplotlib")
+
+# %% [markdown]
+# ## 14. 将最优参数更新到 Pine Script 文件 (Update Pine Script with Optimal Parameters)
+# 读取 Pine Script 模板文件，并将 Optuna 找到的最优参数替换到对应的 input 中，然后保存为新文件。
+
+# %%
+def update_pine_script_with_params(best_params: dict, template_file: str, output_file: str):
+    """
+    读取 Pine Script 模板文件，用最优参数更新 input 值，并写入新文件。
+
+    Args:
+        best_params (dict): 包含最优参数的字典。
+        template_file (str): Pine Script 模板文件的路径。
+        output_file (str): 要写入的优化后 Pine Script 文件的路径。
+    """
+    print(f"\n--- 开始更新 Pine Script 文件 ---")
+    print(f"模板文件: {template_file}")
+    print(f"输出文件: {output_file}")
+
+    try:
+        with open(template_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        updated_lines = []
+        # 正则表达式匹配 input.int() 或 input.float()
+        # 捕获: 1=参数名, 2=类型(int/float), 3=默认值, 4=后续部分(包含标题等)
+        # 修改正则表达式以正确处理可能的多行注释和参数
+        # 匹配以空格开头，然后是参数名=input.类型(值, ...)
+        pattern = re.compile(r"^(\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*input\.(int|float)\(\s*([\-0-9.]+)\s*,(.*)")
+
+        updated_count = 0
+        skipped_params = set(best_params.keys()) # 用于追踪未在模板中找到的参数
+
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                indent, param_name, param_type, default_value_str, rest_of_line = match.groups()
+
+                if param_name in best_params:
+                    optimized_value = best_params[param_name]
+                    # 格式化优化后的值
+                    if param_type == 'int':
+                        formatted_value = str(int(optimized_value))
+                    else: # float
+                        # 保留合理的小数位数，例如最多6位
+                        formatted_value = f"{optimized_value:.6f}".rstrip('0').rstrip('.')
+                        if '.' not in formatted_value: # 如果恰好是整数
+                             formatted_value += '.0'
+
+                    # 构建新的行，保留原始格式，只替换数值
+                    updated_line = f"{indent}{param_name} = input.{param_type}({formatted_value},{rest_of_line}\n"
+                    updated_lines.append(updated_line)
+                    updated_count += 1
+                    skipped_params.discard(param_name) # 从集合中移除已找到的参数
+                    # print(f"  更新参数: {param_name} = {formatted_value} (原: {default_value_str})")
+                else:
+                    # 如果参数在模板中但不在 best_params 中 (例如固定的 macd_signal)，保留原样
+                    updated_lines.append(line)
+            else:
+                # 非 input 定义行，直接保留
+                updated_lines.append(line)
+
+        # 写入新文件
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.writelines(updated_lines)
+
+        print(f"Pine Script 文件更新完成。共更新 {updated_count} 个参数。")
+        if skipped_params:
+            print(f"警告：以下优化参数未在模板文件 '{template_file}' 中找到对应的 input 定义，请检查：")
+            for p in sorted(list(skipped_params)):
+                 print(f"  - {p}")
+
+    except FileNotFoundError:
+        print(f"错误：找不到模板文件 '{template_file}'")
+    except Exception as e:
+        print(f"更新 Pine Script 文件时发生错误：{e}")
+
+# 在脚本末尾调用该函数
+pine_template_path = 'pine_optimized.txt'
+pine_output_path = 'pine_strategy_final_optimized.pine' # 输出文件名
+update_pine_script_with_params(best_params_complete, pine_template_path, pine_output_path)
+
 
 # 同时在最终的结果中展示完整的最佳参数
 print("\n最终优化参数结果:")
