@@ -1,51 +1,54 @@
 //@version=6
 //(Updated 2025/04/07 - 双阈值差额评分机制：多空信号使用各自的差额阈值)
 //(Updated 2025/04/11 - 添加动态ADX过滤器)
-strategy("Enhanced Tesla Reversal Strategy v13 (Dynamic ADX)", overlay=true, pyramiding=2, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
+strategy("Enhanced Tesla Reversal Strategy v13 (Dynamic ADX)", overlay=true, pyramiding=1, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
 
 // === 输入参数 ===
 // 这里使用优化后的参数值（示例值，具体应使用Optuna优化结果）
-rsi_length = input.int(5, "RSI长度", minval=1)
-iv_length = input.int(110, "隐含波动率周期", minval=50)
-macd_fast = input.int(7, "MACD快线周期")
-macd_slow = input.int(28, "MACD慢线周期")
+rsi_length = input.int(6, "RSI长度", minval=1)
+iv_length = input.int(70, "隐含波动率周期", minval=50)
+macd_fast = input.int(8, "MACD快线周期")
+macd_slow = input.int(33, "MACD慢线周期")
 macd_signal = input.int(9, "MACD信号周期")
-adx_length = input.int(20, "ADX长度") // ADX计算周期
+adx_length = input.int(18, "ADX长度") // ADX计算周期
 volume_ma_period = input.int(34, "成交量均线周期")
 
 // Volume Spike参数
-volume_spike_window = input.int(27, "成交量峰值窗口", minval=5)
-volume_spike_mult = input.float(2.0, "成交量峰值倍数", minval=1.2)
+volume_spike_window = input.int(17, "成交量峰值窗口", minval=5)
+volume_spike_mult = input.float(3.0, "成交量峰值倍数", minval=1.2)
 
-rsi_low_percentile = input.int(29, "RSI低分位数")
-rsi_high_percentile = input.int(68, "RSI高分位数")
-iv_low_percentile = input.int(26, "IV低分位数")
-iv_high_percentile = input.int(76, "IV高分位数")
-take_profit_mult = input.float(2.0, "止盈波动率倍数", minval=0.5)
-stop_loss_mult = input.float(1.75, "止损波动率倍数", minval=0.5)
+rsi_low_percentile = input.int(24, "RSI低分位数")
+rsi_high_percentile = input.int(67, "RSI高分位数")
+iv_low_percentile = input.int(29, "IV低分位数")
+iv_high_percentile = input.int(63, "IV高分位数")
+take_profit_mult = input.float(3.0, "止盈波动率倍数", minval=0.5)
+stop_loss_mult = input.float(4.75, "止损波动率倍数", minval=0.5)
 
 // 新的多空差额阈值，分别设置多头和空头阈值
-bull_score_threshold = input.float(0.55, "多头差额阈值", minval=-1.0, maxval=1.0)
-bear_score_threshold = input.float(-0.25, "空头差额阈值", minval=-1.0, maxval=1.0)
+bull_score_threshold = input.float(0.35, "多头差额阈值", minval=-1.0, maxval=1.0)
+bear_score_threshold = input.float(-0.1, "空头差额阈值", minval=-1.0, maxval=1.0)
 
 // === 动态 ADX 过滤器参数 ===
-adx_filter_lookback = input.int(150, "ADX动态阈值回看期", minval=50)
-adx_filter_percentile = input.int(37, "ADX基础阈值分位数", minval=5, maxval=50)
+adx_filter_lookback = input.int(250, "ADX动态阈值回看期", minval=50)
+adx_filter_percentile = input.int(18, "ADX基础阈值分位数", minval=5, maxval=50)
 adx_volatility_period = input.int(20, "ADX波动性周期", minval=5)
-adx_threshold_min = input.float(16.0, "ADX最小动态阈值", minval=5.0)
-adx_threshold_max = input.float(21.0, "ADX最大动态阈值", minval=15.0)
-adx_volatility_impact = input.float(0.1, "ADX波动性影响因子", minval=0.0, maxval=1.0, step=0.1)
+adx_threshold_min = input.float(11.0, "ADX最小动态阈值", minval=5.0)
+adx_threshold_max = input.float(32.0, "ADX最大动态阈值", minval=15.0)
+adx_volatility_impact = input.float(0.8, "ADX波动性影响因子", minval=0.0, maxval=1.0, step=0.1)
+
+// === 新增：固定时间限制 ===
+time_limit_bars = input.int(23, "最大持仓K线数", minval=5)
 
 // === 权重设置（超简化版，仅保留RSI, IV, MACD和Volume权重） ===
-rsi_bull_weight = input.float(0.35, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
-iv_bull_weight = input.float(0.25, "IV多头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
-macd_bull_weight = input.float(0.5, "MACD多头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
-volume_bull_weight = input.float(0.15, "成交量多头权重", minval=0.0, maxval=0.3, step=0.05)
+rsi_bull_weight = input.float(0.5, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
+iv_bull_weight = input.float(0.3, "IV多头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
+macd_bull_weight = input.float(0.3, "MACD多头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
+volume_bull_weight = input.float(0.3, "成交量多头权重", minval=0.0, maxval=0.3, step=0.05)
 
-rsi_bear_weight = input.float(0.25, "RSI空头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
-iv_bear_weight = input.float(0.4, "IV空头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
-macd_bear_weight = input.float(0.3, "MACD空头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
-volume_bear_weight = input.float(0.05, "成交量空头权重", minval=0.0, maxval=0.3, step=0.05)
+rsi_bear_weight = input.float(0.5, "RSI空头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
+iv_bear_weight = input.float(0.35, "IV空头权重", minval=0.0, maxval=0.4, step=0.05)   // 增加权重以补偿移除的权重
+macd_bear_weight = input.float(0.45, "MACD空头权重", minval=0.0, maxval=0.5, step=0.05)  // 保持原有权重，不需要加倍
+volume_bear_weight = input.float(0.15, "成交量空头权重", minval=0.0, maxval=0.3, step=0.05)
 
 // === 指标计算 ===
 rsi = ta.rsi(close, rsi_length)
@@ -156,6 +159,17 @@ if strategy.position_size < 0  // 如果持有空头仓位
     short_stop = strategy.position_avg_price * (1 + hv / 100 * stop_loss_mult)
     strategy.exit("Exit Short", from_entry="Short", stop=short_stop, limit=short_take)
 
+// === 新增：强制时间平仓 ===
+bars_held = bar_index - strategy.opentrades.entry_bar_index(strategy.opentrades - 1) // 计算当前持仓的K线数
+
+// 多头时间平仓
+if strategy.position_size > 0 and bars_held >= time_limit_bars
+    strategy.close("Long", comment="Time Stop Long")
+
+// 空头时间平仓
+if strategy.position_size < 0 and bars_held >= time_limit_bars
+    strategy.close("Short", comment="Time Stop Short")
+
 // === 图表显示 ===
 plot(bullish_score, "多头评分", color=color.green, linewidth=2)
 plot(bearish_score, "空头评分", color=color.red, linewidth=2)
@@ -165,7 +179,7 @@ hline(bear_score_threshold, "空头差额阈值", color=color.red, linestyle=hli
 hline(0, "零轴", color=color.gray, linestyle=hline.style_dotted)
 
 // 显示动态 ADX 阈值和 ADX 值
-plot(adx_thresh_val, "动态ADX阈值", color=color.orange, linestyle=plot.style_linebr)
+hline(adx_thresh_val, "动态ADX阈值", color=color.orange, linestyle=plot.style_linebr)
 plot(adx_value, "ADX值", color=color.purple, linewidth=1)
 
 // 显示Volume Spike

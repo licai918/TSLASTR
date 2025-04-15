@@ -55,8 +55,8 @@ print(f"系统CPU核心数: {cpu_count}")
 # %%
 # --- 回测和数据参数 ---
 TICKER = "TSLA"
-START_DATE = "2025-03-17" # 修改为更合理的历史日期范围
-END_DATE = "2025-04-11"   # 修改为当前或过去的日期
+START_DATE = "2025-01-01" # 修改为更合理的历史日期范围
+END_DATE = "2025-04-12"   # 修改为当前或过去的日期
 INTERVAL = "1h"          # 数据频率 ('1d', '1h', '30m', etc.) - 从'2h'改为'1h'，因为YF不支持2h间隔
 
 # --- 策略默认参数 (来自 Pine Script) ---
@@ -94,7 +94,8 @@ initial_params = {
     'adx_volatility_period': 20,      # ADX波动性计算周期
     'adx_threshold_min': 15.0,        # 最小动态阈值
     'adx_threshold_max': 25.0,        # 最大动态阈值
-    'adx_volatility_impact': 0.5      # 波动性影响因子 (0 to 1)
+    'adx_volatility_impact': 0.5,     # 波动性影响因子 (0 to 1)
+    'time_limit_bars': 20             # 新增：持仓时间上限 (K线数)
 }
 
 # --- vectorbt 回测设置 ---
@@ -103,7 +104,7 @@ PYRAMIDING = 1 # 允许的金字塔加仓次数
 PCT_OF_EQUITY = 100 # 每次交易使用的资金比例
 
 # --- Optuna 优化设置 ---
-N_TRIALS = 500 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
+N_TRIALS = 5000 # 增加优化尝试次数，从30次增加到500次进行更彻底的参数搜索
 OPTIMIZATION_METRIC = 'Total Return [%]' # 用于优化的目标指标 ('Total Return [%]', 'Sharpe Ratio', 'Max Drawdown [%]')
 
 # %% [markdown]
@@ -372,11 +373,11 @@ def calculate_scores_nb(
             
             # Bullish score components
             # RSI低于低阈值，多头信号
-            if rsi[i] <= rsi_low_thresh[i] * 1.1:  # 放宽10%
+            if rsi[i] < rsi_low_thresh[i] * 1.1:  # 修正：使用 < 匹配 Pine Script
                 bull_score += rsi_bull_w
                 
             # IV高于高阈值，多头信号 (波动率高可能意味着拐点)
-            if iv_rank[i] >= iv_high_thresh[i] * 0.9:  # 放宽10%
+            if iv_rank[i] > iv_high_thresh[i] * 0.9:  # 修正：使用 > 匹配 Pine Script
                 bull_score += iv_bull_w
                 
             # MACD线在信号线上方，且MACD线上升，多头信号
@@ -388,11 +389,11 @@ def calculate_scores_nb(
             
             # =========== 空头信号 ===========
             # RSI高于高阈值，空头信号
-            if rsi[i] >= rsi_high_thresh[i] * 0.9:  # 放宽10%
+            if rsi[i] > rsi_high_thresh[i] * 0.9:  # 修正：使用 > 匹配 Pine Script
                 bear_score += rsi_bear_w
                 
             # IV低于低阈值，空头信号
-            if iv_rank[i] <= iv_low_thresh[i] * 1.1:  # 放宽10%
+            if iv_rank[i] < iv_low_thresh[i] * 1.1:  # 修正：使用 < 匹配 Pine Script
                 bear_score += iv_bear_w
                 
             # MACD线在信号线下方，且MACD线下降，空头信号
@@ -409,14 +410,50 @@ def calculate_scores_nb(
 
     return bullish_scores, bearish_scores
 
+@njit
+def generate_exits_nb(
+    entries: np.ndarray,
+    time_limit_bars: int
+) -> np.ndarray:
+    """
+    Numba JIT 函数，根据固定的持仓 K 线数限制生成退出信号。
+    """
+    exits = np.full_like(entries, False)
+    entry_indices = np.where(entries)[0]
+    if len(entry_indices) == 0:
+        return exits
+
+    last_entry_idx = -1
+    current_holding_bars = 0
+
+    for i in range(len(entries)):
+        if entries[i]:
+            # 如果在当前持仓期间内又出现入场信号，忽略（vectorbt处理 pyramiding，这里只处理第一个入场）
+            # 检查是否有新的入场信号，但只有在没有活跃持仓时才更新 last_entry_idx
+            if last_entry_idx == -1 or not np.any(exits[last_entry_idx:i]): # 确保前一个交易已退出
+                 last_entry_idx = i
+                 current_holding_bars = 0
+            # 如果已经有持仓且出现新信号（金字塔），时间限制仍然基于最初的入场点
+
+        if last_entry_idx != -1: # 如果有活跃持仓
+            current_holding_bars = i - last_entry_idx
+            if current_holding_bars >= time_limit_bars:
+                exits[i] = True
+                last_entry_idx = -1 # 重置，标记交易结束
+                current_holding_bars = 0
+            # 注意：这里没有处理 SL/TP 导致的退出，这个函数只生成时间退出信号
+            # vectorbt 的 Portfolio 会处理 SL/TP 退出
+
+    return exits
 
 def generate_signals(indicator_df: pd.DataFrame, params: dict) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """
-    根据评分生成入场信号，包括多头和空头信号。
+    根据评分生成入场信号，并根据固定时间限制生成离场信号。
     使用双阈值差额评分机制生成交易信号，与更新后的Pine Script策略保持一致。
     返回多头入场、多头离场、空头入场、空头离场信号。
+    止盈止损由 vectorbt Portfolio 处理。
     """
-    # 确保所有数组都转换为numpy的float64类型，以避免Numba类型错误
+    # --- 计算评分 (与之前一致) ---
     close_arr = indicator_df['close'].values.astype(np.float64)
     volume_arr = indicator_df['volume'].values.astype(np.float64)
     rsi_arr = indicator_df['rsi'].values.astype(np.float64)
@@ -471,19 +508,30 @@ def generate_signals(indicator_df: pd.DataFrame, params: dict) -> tuple[pd.Serie
     # 计算评分差额
     indicator_df['score_difference'] = indicator_df['bullish_score'] - indicator_df['bearish_score']
 
-    # 生成交易信号 - 基于双阈值差额评分机制
-    # 多头信号: 评分差额 >= 多头差额阈值
-    long_entries = (indicator_df['score_difference'] >= params['bull_score_threshold'])
-    
-    # 空头信号: 评分差额 <= 空头差额阈值
-    short_entries = (indicator_df['score_difference'] <= params['bear_score_threshold'])
-    
-    # 正确实现Pine Script策略的退出逻辑
-    # 在Pine Script中，退出信号是通过止盈止损设置的，而不是通过相反的信号
-    long_exits = pd.Series(False, index=indicator_df.index)  # 初始化为全False
-    short_exits = pd.Series(False, index=indicator_df.index)  # 初始化为全False
-    
-    return long_entries, long_exits, short_entries, short_exits
+    # --- 生成入场信号 (与之前一致) ---
+    long_entries = (indicator_df['score_difference'] >= params['bull_score_threshold']).values
+    short_entries = (indicator_df['score_difference'] <= params['bear_score_threshold']).values
+
+    # --- 生成基于时间限制的退出信号 --- 
+    time_limit = params.get('time_limit_bars', 20) # 获取时间限制参数，默认20
+
+    # 对多头和空头分别计算时间退出信号
+    long_time_exits_arr = generate_exits_nb(long_entries, time_limit)
+    short_time_exits_arr = generate_exits_nb(short_entries, time_limit)
+
+    # --- 整合退出信号 --- 
+    # vectorbt 的 from_signals 会自动处理 SL/TP 退出。
+    # 我们只需要提供由时间限制触发的退出信号。
+    # 注意：这里的 long_exits 和 short_exits 仅包含时间退出信号。
+    # 如果未来有其他基于指标的退出逻辑，需要在这里用 | 合并。
+    long_exits = pd.Series(long_time_exits_arr, index=indicator_df.index)
+    short_exits = pd.Series(short_time_exits_arr, index=indicator_df.index)
+
+    # 将入场信号转回 Pandas Series
+    long_entries_series = pd.Series(long_entries, index=indicator_df.index)
+    short_entries_series = pd.Series(short_entries, index=indicator_df.index)
+
+    return long_entries_series, long_exits, short_entries_series, short_exits
 
 
 # %% [markdown]
@@ -830,6 +878,9 @@ def objective(trial: optuna.Trial) -> float:
         'adx_threshold_min': trial.suggest_float('adx_threshold_min', 10.0, 20.0, step=1.0),
         'adx_threshold_max': trial.suggest_float('adx_threshold_max', 20.0, 35.0, step=1.0),
         'adx_volatility_impact': trial.suggest_float('adx_volatility_impact', 0.1, 1.0, step=0.1),
+
+        # --- 新增：固定时间限制 --- 
+        'time_limit_bars': trial.suggest_int('time_limit_bars', 15, 25) # 优化范围15-25根K线
     }
     # 确保 MACD 慢线 > 快线
     if params['macd_slow'] <= params['macd_fast']:
@@ -974,6 +1025,7 @@ print(f"  adx_volatility_period: {best_params_complete['adx_volatility_period']}
 print(f"  adx_threshold_min: {best_params_complete['adx_threshold_min']}")
 print(f"  adx_threshold_max: {best_params_complete['adx_threshold_max']}")
 print(f"  adx_volatility_impact: {best_params_complete['adx_volatility_impact']}")
+print(f"  time_limit_bars: {best_params_complete['time_limit_bars']}") # 显示优化后的时间限制
 
 
 # %% [markdown]
@@ -1197,6 +1249,8 @@ def update_pine_script_with_params(best_params: dict, template_file: str, output
 
         updated_count = 0
         skipped_params = set(best_params.keys()) # 用于追踪未在模板中找到的参数
+        # 特殊处理 macd_signal，因为它不在 best_params 中，但可能在模板里
+        skipped_params.discard('macd_signal')
 
         for line in lines:
             match = pattern.match(line)

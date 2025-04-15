@@ -1,7 +1,7 @@
 //@version=6
 //(Updated 2025/04/07 - 双阈值差额评分机制：多空信号使用各自的差额阈值)
 //(Updated 2025/04/11 - 添加动态ADX过滤器)
-strategy("Enhanced Tesla Reversal Strategy v13 (Dynamic ADX)", overlay=true, pyramiding=2, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
+strategy("Enhanced Tesla Reversal Strategy v13 (Dynamic ADX)", overlay=true, pyramiding=1, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, max_bars_back=252)
 
 // === 输入参数 ===
 // 这里使用优化后的参数值（示例值，具体应使用Optuna优化结果）
@@ -35,6 +35,9 @@ adx_volatility_period = input.int(20, "ADX波动性周期", minval=5)
 adx_threshold_min = input.float(15.0, "ADX最小动态阈值", minval=5.0)
 adx_threshold_max = input.float(25.0, "ADX最大动态阈值", minval=15.0)
 adx_volatility_impact = input.float(0.5, "ADX波动性影响因子", minval=0.0, maxval=1.0, step=0.1)
+
+// === 新增：固定时间限制 ===
+time_limit_bars = input.int(20, "最大持仓K线数", minval=5)
 
 // === 权重设置（超简化版，仅保留RSI, IV, MACD和Volume权重） ===
 rsi_bull_weight    = input.float(0.35, "RSI多头权重", minval=0.0, maxval=0.5, step=0.05)  // 增加权重以补偿移除的权重
@@ -155,6 +158,17 @@ if strategy.position_size < 0  // 如果持有空头仓位
     short_take = strategy.position_avg_price * (1 - hv / 100 * take_profit_mult)
     short_stop = strategy.position_avg_price * (1 + hv / 100 * stop_loss_mult)
     strategy.exit("Exit Short", from_entry="Short", stop=short_stop, limit=short_take)
+
+// === 新增：强制时间平仓 ===
+bars_held = bar_index - strategy.opentrades.entry_bar_index(strategy.opentrades - 1) // 计算当前持仓的K线数
+
+// 多头时间平仓
+if strategy.position_size > 0 and bars_held >= time_limit_bars
+    strategy.close("Long", comment="Time Stop Long")
+
+// 空头时间平仓
+if strategy.position_size < 0 and bars_held >= time_limit_bars
+    strategy.close("Short", comment="Time Stop Short")
 
 // === 图表显示 ===
 plot(bullish_score, "多头评分", color=color.green, linewidth=2)
